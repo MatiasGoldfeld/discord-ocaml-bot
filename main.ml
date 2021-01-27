@@ -42,24 +42,19 @@ let temp (message : Message.t) (code : string) : Message.t Deferred.Or_error.t =
       | stdout, stderr ->
         "\nstdout:```\n" ^ stdout ^ "\n```stderr:```\n" ^ stderr ^ "\n```"
     in
-    print_endline (Int.to_string (String.length reply_msg));
     if String.length reply_msg <= 2000 then
-      Message.reply message reply_msg
+      Message.reply_with ~tts:true ~content:reply_msg message
     else
-      let%bind path, fd = Unix.mkstemp "/tmp/discord.ocaml.bot" in
-      let writer = Writer.create fd in
-      Writer.write writer reply_msg;
-      let%bind () = Writer.close writer in
-      let%bind ret = Message.reply_with ~file:path ~content:exit_msg message in
-      let%map () = Unix.remove path in ret
+      Message.reply_with ~tts:true ~content:exit_msg ~files:[("output.txt", reply_msg)] message
 
 let check_command (message : Message.t) : unit =
-  print_endline message.content;
   if Pcre.pmatch ~rex:prefix_pattern message.content then
     try
       let substrings = Pcre.exec ~rex:command_pattern message.content in
       let code = Pcre.get_substring substrings 2 in
-      temp message code >>> ignore
+      temp message code >>> function
+      | Ok _ -> print_endline "Success"
+      | Error e -> Error.to_string_hum e |> print_endline
     with Caml.Not_found ->
       Message.reply message "Error: Invalid command format." >>> ignore
 
