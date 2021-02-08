@@ -60,20 +60,28 @@ let run (message : Message.t) (code : string) : Message.t Deferred.Or_error.t =
     let stdin = Process.stdin ps in
     Writer.write_line stdin wipe_sys;
     Writer.write stdin code;
+    let start = Unix.gettimeofday () in
     timeout_kill ps;
     let%bind output = Process.collect_output_and_wait ps in
-    (* TODO: Differ replies based on exit status *)
-    begin match output.exit_status with
-      | Error (`Exit_non_zero exit_code) -> ignore exit_code
-      | Error (`Signal signal) when Signal.(signal = kill) -> ignore signal
-      | Error (`Signal signal) -> ignore signal
-      | Ok () -> ()
-    end;
-    let exit_msg = Unix.Exit_or_signal.to_string_hum output.exit_status in
-    let%bind out_msg = match output.stdout, output.stderr with 
-      | "", "" -> interface code
-      | out, "" | "", out -> return @@ "```\n" ^ sanitize out ^ "\n```"
-      | stdout, stderr -> return @@
+    let duration = Float.(Unix.gettimeofday () - start
+                   |> to_string_hum ~delimiter:',' ~decimals:2) ^ "s"
+    in
+    let exit_msg = match output.exit_status with
+    | Error (`Exit_non_zero exit_code) ->
+      "Exited with code " ^ string_of_int exit_code ^ " after " ^ duration
+    | Error (`Signal signal) when Signal.(signal = kill) ->
+      "Timed out after " ^ duration
+    | Error (`Signal signal) ->
+      "Died from " ^ Signal.to_string signal ^ " signal after " ^ duration
+    | Ok () ->
+      "Exited normally after " ^ duration
+    in
+    let%bind out_msg =
+      match output.exit_status, output.stdout, output.stderr with 
+      | Ok (), "", "" -> interface code
+      | _, "", "" -> return ""
+      | _, out, "" | _, "", out -> return @@ "```\n" ^ sanitize out ^ "\n```"
+      | _, stdout, stderr -> return @@
         sprintf "stdout:```\n%s\n```stderr:```\n%s\n```"
                 (sanitize stdout) (sanitize stderr)
     in
