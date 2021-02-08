@@ -30,10 +30,10 @@ let interface (code : string) : string Deferred.t =
                         ~args:["-color"; "never"; "-i"; "-impl"; path] ()
   in
   upon out (fun _ -> Unix.remove path >>> ignore);
-  out >>| function
+  Deferred.Or_error.map out ~f:String.strip >>| function
   | Error _ -> ""
   | Ok "" -> ""
-  | Ok out -> "```ocaml\n" ^ sanitize out ^ "```"
+  | Ok out -> print_endline out; "```ocaml\n" ^ sanitize out ^ "```"
 
 let blank_emoji : Emoji.t = {
   id = None;
@@ -96,7 +96,9 @@ let run (message : Message.t) (code : string) : Message.t Deferred.Or_error.t =
 
 let check_command (message : Message.t) : unit =
   if Pcre.pmatch ~rex:prefix_pattern message.content then
-    try
+    if Option.is_empty message.guild_id then
+      Message.reply message "Please don't slide into my DMs." >>> ignore
+    else try
       let substrings = Pcre.exec ~rex:command_pattern message.content in
       let code = Pcre.get_substring substrings 2 in
       print_endline "Received valid command";
