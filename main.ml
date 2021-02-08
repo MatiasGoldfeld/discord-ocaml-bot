@@ -19,6 +19,22 @@ let wipe_sys =
 let run_ocaml = Process.create ~prog:"/usr/bin/ocaml"
     ~args:["-color"; "never"; "-stdin"; "-noinit"]
 
+let sanitize = Pcre.replace ~pat:"``" ~templ:"`\u{200B}`"
+
+let interface (code : string) : string Deferred.t =
+  let%bind path, fd = Unix.mkstemp "/tmp/discord-ocaml-bot" in
+  let writer = Writer.create fd in
+  Writer.write writer code;
+  let%bind () = Writer.close writer in
+  let out = Process.run ~prog:"/usr/bin/ocamlc"
+                        ~args:["-color"; "never"; "-i"; "-impl"; path] ()
+  in
+  upon out (fun _ -> Unix.remove path >>> ignore);
+  out >>| function
+  | Error _ -> ""
+  | Ok "" -> ""
+  | Ok out -> "```ocaml\n" ^ sanitize out ^ "```"
+
 let blank_emoji : Emoji.t = {
   id = None;
   name = "";
@@ -40,33 +56,35 @@ let timeout_kill : Process.t -> unit =
     Process.send_signal ps Signal.kill
 
 let run (message : Message.t) (code : string) : Message.t Deferred.Or_error.t =
-  run_ocaml () >>= function
-  | Error _ as e ->
-    print_endline "Error creating new process";
-    return e
-  | Ok ps ->
+  let f ps =
     let stdin = Process.stdin ps in
     Writer.write_line stdin wipe_sys;
     Writer.write stdin code;
     timeout_kill ps;
     let%bind output = Process.collect_output_and_wait ps in
-    begin match output.exit_status with (* TODO: Differ replies based on exit status *)
+    (* TODO: Differ replies based on exit status *)
+    begin match output.exit_status with
       | Error (`Exit_non_zero exit_code) -> ignore exit_code
       | Error (`Signal signal) when Signal.(signal = kill) -> ignore signal
       | Error (`Signal signal) -> ignore signal
       | Ok () -> ()
     end;
     let exit_msg = Unix.Exit_or_signal.to_string_hum output.exit_status in
-    let reply_msg = exit_msg ^ match output.stdout, output.stderr with 
-      | "", "" -> ""
-      | out, "" | "", out -> "\n```\n" ^ out ^ "\n```"
-      | stdout, stderr ->
-        sprintf "\nstdout:```\n%s\n```stderr:```\n%s\n```" stdout stderr
+    let%bind out_msg = match output.stdout, output.stderr with 
+      | "", "" -> interface code
+      | out, "" | "", out -> return @@ "```\n" ^ sanitize out ^ "\n```"
+      | stdout, stderr -> return @@
+        sprintf "stdout:```\n%s\n```stderr:```\n%s\n```"
+                (sanitize stdout) (sanitize stderr)
     in
+    let reply_msg = exit_msg ^ "\n" ^ out_msg in
     if String.length reply_msg <= 2000 then
       Message.reply_with ~reply_mention:true ~content:reply_msg message
     else
-      Message.reply_with ~reply_mention:true ~content:exit_msg ~files:[("output.txt", reply_msg)] message
+      Message.reply_with ~reply_mention:true ~content:exit_msg
+                         ~files:[("output.txt", reply_msg)] message
+  in
+  Deferred.Or_error.bind (run_ocaml ()) ~f:f
 
 let check_command (message : Message.t) : unit =
   if Pcre.pmatch ~rex:prefix_pattern message.content then
