@@ -31,9 +31,8 @@ let interface (code : string) : string Deferred.t =
   in
   upon out (fun _ -> Unix.remove path >>> ignore);
   Deferred.Or_error.map out ~f:String.strip >>| function
-  | Error _ -> ""
-  | Ok "" -> ""
-  | Ok out -> print_endline out; "```ocaml\n" ^ sanitize out ^ "```"
+  | Error _ | Ok "" -> ""
+  | Ok out -> "```ocaml\n" ^ sanitize out ^ "```"
 
 let blank_emoji : Emoji.t = {
   id = None;
