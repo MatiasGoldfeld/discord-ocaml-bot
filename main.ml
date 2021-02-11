@@ -25,7 +25,7 @@ let run_ocaml_script, run_ocaml_top =
 
 let sanitize = Pcre.replace ~pat:"``" ~templ:"`\u{200B}`"
 
-let interface (code : string) : string Deferred.t =
+let toplevel (code : string) : string Deferred.t =
   match%bind run_ocaml_top () with
   | Error e ->
     print_endline ("Error in toplevel: " ^ Error.to_string_hum e);
@@ -36,7 +36,9 @@ let interface (code : string) : string Deferred.t =
     Writer.write stdin code;
     Writer.write stdin ocaml_top_append;
     let%bind output = Process.collect_output_and_wait ps in
-    return ("```ocaml\n" ^ (sanitize output.stdout) ^ "\n```")
+    match output.stdout |> String.strip |> sanitize with
+    | "" -> return ""
+    | stdout -> return ("```ocaml\n" ^ stdout ^ "\n```")
 
 let blank_emoji : Emoji.t = {
   id = None;
@@ -63,7 +65,7 @@ let run (message : Message.t) (code : string) : Message.t Deferred.Or_error.t =
       match output.exit_status with
       | Error (`Exit_non_zero exit_code) ->
         "Exited with code " ^ string_of_int exit_code ^ " after " ^ duration
-      | Error (`Signal signal) when Signal.(signal = kill || signal = term) ->
+      | Error (`Signal signal) when Signal.(signal = kill) ->
         "Timed out after " ^ duration
       | Error (`Signal signal) ->
         "Died from " ^ Signal.to_string signal ^ " signal after " ^ duration
@@ -72,7 +74,7 @@ let run (message : Message.t) (code : string) : Message.t Deferred.Or_error.t =
     in
     let%bind out_msg =
       match output.exit_status, output.stdout, output.stderr with 
-      | Ok (), "", "" -> interface code
+      | Ok (), "", "" -> toplevel code
       | _, "", "" -> return ""
       | _, out, "" | _, "", out -> return ("```\n" ^ sanitize out ^ "\n```")
       | _, stdout, stderr -> return @@
