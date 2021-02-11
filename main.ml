@@ -7,32 +7,36 @@ let prefix_pattern = Pcre.regexp "^!ocaml(?:\\s|```)"
 let command_pattern = Pcre.regexp
     "^!ocaml(?:\\s+|(?=```))(`{0,3})(?:(?<=```)ocaml\n)?([\\s\\S]+)\\1"
 
-(* This is here for security purposes. It is probably not enough, but the
-   intention is to prevent Discord users from accessing your system. *)
-let wipe_sys = 
-  "module Sys = struct end \
-   module Stdlib = struct include Stdlib module Sys = struct end end;;"
+let ocaml_prepend = "#load \"unix.cma\";;\n"
+let ocaml_top_append = ";;\n"
 
-(* Warning: If ocaml is not called directly, then the system will open ocaml
-   through the shell, which will likely cause this program to be unable to 
-   properly kill the ocaml instance, as it does not respond to SIGHUP. *)
-let run_ocaml = Process.create ~prog:"/usr/bin/ocaml"
-    ~args:["-color"; "never"; "-stdin"; "-noinit"]
+let run_ocaml_script, run_ocaml_top =
+  let timeout =
+    Sys.getenv "DISCORD_OCAML_BOT_TIMEOUT"
+    |> Option.value ~default:"5"
+  in
+  let args =
+    ["-s"; "KILL"; timeout;
+     "docker"; "run"; "-i"; "ocaml/opam:latest";
+     "ocaml"; "-color"; "never"]
+  in
+  Process.create ~prog:"timeout" ~args:(args @ ["-stdin"]),
+  Process.create ~prog:"timeout" ~args:(args @ ["-noprompt"; "-no-version"])
 
 let sanitize = Pcre.replace ~pat:"``" ~templ:"`\u{200B}`"
 
 let interface (code : string) : string Deferred.t =
-  let%bind path, fd = Unix.mkstemp "/tmp/discord-ocaml-bot" in
-  let writer = Writer.create fd in
-  Writer.write writer code;
-  let%bind () = Writer.close writer in
-  let out = Process.run ~prog:"/usr/bin/ocamlc"
-                        ~args:["-color"; "never"; "-i"; "-impl"; path] ()
-  in
-  upon out (fun _ -> Unix.remove path >>> ignore);
-  Deferred.Or_error.map out ~f:String.strip >>| function
-  | Error _ | Ok "" -> ""
-  | Ok out -> "```ocaml\n" ^ sanitize out ^ "```"
+  match%bind run_ocaml_top () with
+  | Error e ->
+    print_endline ("Error in toplevel: " ^ Error.to_string_hum e);
+    return ""
+  | Ok ps ->
+    let stdin = Process.stdin ps in
+    Writer.write_line stdin ocaml_prepend;
+    Writer.write stdin code;
+    Writer.write stdin ocaml_top_append;
+    let%bind output = Process.collect_output_and_wait ps in
+    return ("```ocaml\n" ^ (sanitize output.stdout) ^ "\n```")
 
 let blank_emoji : Emoji.t = {
   id = None;
@@ -44,70 +48,61 @@ let blank_emoji : Emoji.t = {
   animated = false;
 }
 
-let timeout_kill : Process.t -> unit =
-  let timeout_secs =
-    Sys.getenv "DISCORD_OCAML_BOT_TIMEOUT"
-    |> Option.bind ~f:float_of_string_opt
-    |> Option.value ~default:15.
-    |> Time.Span.of_sec
-  in fun ps ->
-    after timeout_secs >>> fun () ->
-    Process.send_signal ps Signal.kill
-
 let run (message : Message.t) (code : string) : Message.t Deferred.Or_error.t =
   let f ps =
     let stdin = Process.stdin ps in
-    Writer.write_line stdin wipe_sys;
+    Writer.write_line stdin ocaml_prepend;
     Writer.write stdin code;
     let start = Unix.gettimeofday () in
-    timeout_kill ps;
     let%bind output = Process.collect_output_and_wait ps in
-    let duration = Float.(Unix.gettimeofday () - start
-                   |> to_string_hum ~delimiter:',' ~decimals:2) ^ "s"
+    let duration =
+      Float.(Unix.gettimeofday () - start
+             |> to_string_hum ~delimiter:',' ~decimals:2) ^ "s"
     in
-    let exit_msg = match output.exit_status with
-    | Error (`Exit_non_zero exit_code) ->
-      "Exited with code " ^ string_of_int exit_code ^ " after " ^ duration
-    | Error (`Signal signal) when Signal.(signal = kill) ->
-      "Timed out after " ^ duration
-    | Error (`Signal signal) ->
-      "Died from " ^ Signal.to_string signal ^ " signal after " ^ duration
-    | Ok () ->
-      "Exited normally after " ^ duration
+    let exit_msg =
+      match output.exit_status with
+      | Error (`Exit_non_zero exit_code) ->
+        "Exited with code " ^ string_of_int exit_code ^ " after " ^ duration
+      | Error (`Signal signal) when Signal.(signal = kill || signal = term) ->
+        "Timed out after " ^ duration
+      | Error (`Signal signal) ->
+        "Died from " ^ Signal.to_string signal ^ " signal after " ^ duration
+      | Ok () ->
+        "Exited normally after " ^ duration
     in
     let%bind out_msg =
       match output.exit_status, output.stdout, output.stderr with 
       | Ok (), "", "" -> interface code
       | _, "", "" -> return ""
-      | _, out, "" | _, "", out -> return @@ "```\n" ^ sanitize out ^ "\n```"
+      | _, out, "" | _, "", out -> return ("```\n" ^ sanitize out ^ "\n```")
       | _, stdout, stderr -> return @@
         sprintf "stdout:```\n%s\n```stderr:```\n%s\n```"
-                (sanitize stdout) (sanitize stderr)
+          (sanitize stdout) (sanitize stderr)
     in
     let reply_msg = exit_msg ^ "\n" ^ out_msg in
     if String.length reply_msg <= 2000 then
       Message.reply_with ~reply_mention:true ~content:reply_msg message
     else
       Message.reply_with ~reply_mention:true ~content:exit_msg
-                         ~files:[("output.txt", reply_msg)] message
+        ~files:[("output.txt", reply_msg)] message
   in
-  Deferred.Or_error.bind (run_ocaml ()) ~f:f
+  Deferred.Or_error.bind (run_ocaml_script ()) ~f:f
 
 let check_command (message : Message.t) : unit =
   if Pcre.pmatch ~rex:prefix_pattern message.content then
     if Option.is_empty message.guild_id then
       Message.reply message "Please don't slide into my DMs." >>> ignore
     else try
-      let substrings = Pcre.exec ~rex:command_pattern message.content in
-      let code = Pcre.get_substring substrings 2 in
-      print_endline "Received valid command";
-      let emoji = if Random.bool () then "🐪" else "🐫" in
-      Message.add_reaction message {blank_emoji with name=emoji} >>> ignore;
-      run message code >>> function
-      | Ok _ -> print_endline "Successfully replied to command"
-      | Error e -> Error.to_string_hum e |> print_endline
-    with Caml.Not_found ->
-      Message.reply message "Error: Invalid command format" >>> ignore
+        let substrings = Pcre.exec ~rex:command_pattern message.content in
+        let code = Pcre.get_substring substrings 2 in
+        print_endline "Received valid command";
+        let emoji = if Random.bool () then "🐪" else "🐫" in
+        Message.add_reaction message {blank_emoji with name=emoji} >>> ignore;
+        run message code >>> function
+        | Ok _ -> print_endline "Successfully replied to command"
+        | Error e -> Error.to_string_hum e |> print_endline
+      with Caml.Not_found ->
+        Message.reply message "Error: Invalid command format" >>> ignore
 
 let main () : unit =
   Client.message_create := check_command;
