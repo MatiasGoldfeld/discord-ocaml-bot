@@ -10,24 +10,21 @@ let command_pattern = Pcre.regexp
 let ocaml_prepend = "#load \"unix.cma\";;\n"
 let ocaml_top_append = ";;\n"
 
-let timeout =
-  Sys.getenv "DISCORD_OCAML_BOT_TIMEOUT"
-  |> Option.value ~default:"15"
-
 let container_id = ref ""
 let ocaml_path = ref ""
 
-let run_ocaml_script () =
-  Process.create ~prog:"docker" ~args:[
-    "exec"; "-i"; !container_id;
-    "timeout"; "-s"; "KILL"; timeout;
-    !ocaml_path; "-color"; "never"; "-stdin"] ()
+let run_ocaml_common args =
+  let timeout =
+    Sys.getenv "DISCORD_OCAML_BOT_TIMEOUT"
+    |> Option.value ~default:"15"
+  in fun () ->
+    Process.create ~prog:"docker" ~args:([
+        "exec"; "-i"; !container_id;
+        "timeout"; "-s"; "KILL"; timeout;
+        !ocaml_path; "-color"; "never"] @ args) ()
 
-let run_ocaml_top () =
-  Process.create ~prog:"docker" ~args:[
-    "exec"; "-i"; !container_id;
-    "timeout"; "-s"; "KILL"; timeout;
-    !ocaml_path; "-color"; "never"; "-noprompt"; "-no-version"] ()
+let run_ocaml_script = run_ocaml_common ["-stdin"]
+let run_ocaml_top = run_ocaml_common ["-noprompt"; "-no-version"]
 
 let sanitize = Pcre.replace ~pat:"``" ~templ:"`\u{200B}`"
 
@@ -45,16 +42,6 @@ let toplevel (code : string) : string Deferred.t =
     match output.stdout |> String.strip |> sanitize with
     | "" -> return ""
     | stdout -> return ("```ocaml\n" ^ stdout ^ "\n```")
-
-let blank_emoji : Emoji.t = {
-  id = None;
-  name = "";
-  roles = [];
-  user = None;
-  require_colons = false;
-  managed = false;
-  animated = false;
-}
 
 let run (message : Message.t) (code : string) : Message.t Deferred.Or_error.t =
   let f ps =
@@ -96,6 +83,16 @@ let run (message : Message.t) (code : string) : Message.t Deferred.Or_error.t =
   in
   Deferred.Or_error.bind (run_ocaml_script ()) ~f:f
 
+let blank_emoji : Emoji.t = {
+  id = None;
+  name = "";
+  roles = [];
+  user = None;
+  require_colons = false;
+  managed = false;
+  animated = false;
+}
+
 let check_command (message : Message.t) : unit =
   if Pcre.pmatch ~rex:prefix_pattern message.content then
     if Option.is_empty message.guild_id then
@@ -116,16 +113,10 @@ let main () : unit Deferred.t =
   let%bind _ =
     Process.run ~prog:"docker" ~args:["kill"; "discord-ocaml-bot"] ()
   in
-  let get_switch () =
-    Process.run_exn
-      ~prog:"docker"
-      ~args:["exec"; !container_id; "opam"; "switch"; "show"] ()
-    >>| String.strip
-  in
   let%bind container =
     Process.run 
       ~prog:"docker"
-      ~args:["run"; "-id"; "--rm"; "--read-only";
+      ~args:["run"; "-id"; "--rm"; "--read-only"; "--cpus=3";
              "--name"; "discord-ocaml-bot"; "ocaml/opam:discord"] ()
   in
   match container with
@@ -135,8 +126,12 @@ let main () : unit Deferred.t =
     exit 1
   | Ok id ->
     container_id := String.strip id;
-    let%bind switch = get_switch () in
-    ocaml_path := "/home/opam/.opam/" ^ switch ^ "/bin/ocaml";
+    let%bind switch =
+      Process.run_exn
+        ~prog:"docker"
+        ~args:["exec"; !container_id; "opam"; "switch"; "show"] ()
+    in
+    ocaml_path := "/home/opam/.opam/" ^ String.strip switch ^ "/bin/ocaml";
     Client.message_create := check_command;
     let _ = Client.start (Sys.getenv_exn "DISCORD_OCAML_BOT_TOKEN") in
     print_endline "Client launched";
