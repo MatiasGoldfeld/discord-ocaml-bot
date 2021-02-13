@@ -10,18 +10,24 @@ let command_pattern = Pcre.regexp
 let ocaml_prepend = "#load \"unix.cma\";;\n"
 let ocaml_top_append = ";;\n"
 
-let run_ocaml_script, run_ocaml_top =
-  let timeout =
-    Sys.getenv "DISCORD_OCAML_BOT_TIMEOUT"
-    |> Option.value ~default:"5"
-  in
-  let args =
-    ["-s"; "KILL"; timeout;
-     "docker"; "run"; "-i"; "ocaml/opam:latest";
-     "ocaml"; "-color"; "never"]
-  in
-  Process.create ~prog:"timeout" ~args:(args @ ["-stdin"]),
-  Process.create ~prog:"timeout" ~args:(args @ ["-noprompt"; "-no-version"])
+let timeout =
+  Sys.getenv "DISCORD_OCAML_BOT_TIMEOUT"
+  |> Option.value ~default:"15"
+
+let container_id = ref ""
+let ocaml_path = ref ""
+
+let run_ocaml_script () =
+  Process.create ~prog:"docker" ~args:[
+    "exec"; "-i"; !container_id;
+    "timeout"; "-s"; "KILL"; timeout;
+    !ocaml_path; "-color"; "never"; "-stdin"] ()
+
+let run_ocaml_top () =
+  Process.create ~prog:"docker" ~args:[
+    "exec"; "-i"; !container_id;
+    "timeout"; "-s"; "KILL"; timeout;
+    !ocaml_path; "-color"; "never"; "-noprompt"; "-no-version"] ()
 
 let sanitize = Pcre.replace ~pat:"``" ~templ:"`\u{200B}`"
 
@@ -106,10 +112,35 @@ let check_command (message : Message.t) : unit =
       with Caml.Not_found ->
         Message.reply message "Error: Invalid command format" >>> ignore
 
-let main () : unit =
-  Client.message_create := check_command;
-  Client.start (Sys.getenv_exn "DISCORD_OCAML_BOT_TOKEN") >>> ignore;
-  print_endline "Client launched"
+let main () : unit Deferred.t =
+  let%bind _ =
+    Process.run ~prog:"docker" ~args:["kill"; "discord-ocaml-bot"] ()
+  in
+  let get_switch () =
+    Process.run_exn
+      ~prog:"docker"
+      ~args:["exec"; !container_id; "opam"; "switch"; "show"] ()
+    >>| String.strip
+  in
+  let%bind container =
+    Process.run 
+      ~prog:"docker"
+      ~args:["run"; "-id"; "--rm"; "--read-only";
+             "--name"; "discord-ocaml-bot"; "ocaml/opam:discord"] ()
+  in
+  match container with
+  | Error e ->
+    print_endline "ERROR: Failed to start docker container";
+    print_endline (Error.to_string_hum e);
+    exit 1
+  | Ok id ->
+    container_id := String.strip id;
+    let%bind switch = get_switch () in
+    ocaml_path := "/home/opam/.opam/" ^ switch ^ "/bin/ocaml";
+    Client.message_create := check_command;
+    let _ = Client.start (Sys.getenv_exn "DISCORD_OCAML_BOT_TOKEN") in
+    print_endline "Client launched";
+    return ()
 
 let _ =
-  Scheduler.go_main ~main ()
+  Scheduler.go_main ~main:(fun () -> main () >>> ignore) ()
