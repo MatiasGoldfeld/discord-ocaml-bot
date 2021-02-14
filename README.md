@@ -6,4 +6,8 @@ This is a OCaml code-eval Discord bot build in OCaml using Jane Street's Async a
 opam pin add disml https://gitlab.com/MatiasGoldfeld/disml.git --dev-repo
 ```
 
-To use the bot, you need to supply it with a bot token as environment variable `DISCORD_OCAML_BOT_TOKEN`. You can also optionally change the default timeout of 15 seconds with the float `DISCORD_OCAML_BOT_TIMEOUT`.
+You must also build the Docker image using the following command at the root of the project.
+
+```
+docker build -t ocaml/opam:discord .
+```
